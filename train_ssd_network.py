@@ -445,6 +445,7 @@ def main(_):
         # =================================================================== #
         # Add summaries from first clone.
         # =================================================================== #
+        import pdb;pdb.set_trace()
         clones = model_deploy.create_clones(deploy_config, clone_fn, [batch_queue])
         first_clone_scope = deploy_config.clone_scope(0)
         # Gather update_ops from the first clone. These contain, for example,

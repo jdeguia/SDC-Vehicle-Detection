@@ -14,12 +14,10 @@
 # ==============================================================================
 """Pre-processing images for SSD-type networks.
 """
-from enum import Enum, IntEnum
+from enum import Enum
+
 import numpy as np
-
 import tensorflow as tf
-import tf_extended as tfe
-
 from tensorflow.python.ops import control_flow_ops
 
 from preprocessing import tf_image
@@ -28,10 +26,9 @@ from nets import ssd_common
 slim = tf.contrib.slim
 
 # Resizing strategies.
-Resize = IntEnum('Resize', ('NONE',                # Nothing!
-                            'CENTRAL_CROP',        # Crop (and pad if necessary).
-                            'PAD_AND_RESIZE',      # Pad, and resize to output shape.
-                            'WARP_RESIZE'))        # Warp resize.
+Resize = Enum('Resize', ('NONE',                # Nothing!
+                         'CENTRAL_CROP',        # Crop (and pad if necessary).
+                         'PAD_AND_RESIZE'))     # Pad, and resize to output .shape
 
 # VGG mean parameters.
 _R_MEAN = 123.
@@ -39,10 +36,8 @@ _G_MEAN = 117.
 _B_MEAN = 104.
 
 # Some training pre-processing parameters.
-BBOX_CROP_OVERLAP = 0.5         # Minimum overlap to keep a bbox after cropping.
-MIN_OBJECT_COVERED = 0.25
-CROP_RATIO_RANGE = (0.6, 1.67)  # Distortion ratio during cropping.
-EVAL_SIZE = (300, 300)
+BBOX_CROP_OVERLAP = 0.4        # Minimum overlap to keep a bbox after cropping.
+CROP_RATIO_RANGE = (0.8, 1.2)  # Distortion ratio during cropping.
 
 
 def tf_image_whitened(image, means=[_R_MEAN, _G_MEAN, _B_MEAN]):
@@ -176,11 +171,10 @@ def distort_color(image, color_ordering=0, fast_mode=True, scope=None):
 def distorted_bounding_box_crop(image,
                                 labels,
                                 bboxes,
-                                min_object_covered=0.3,
+                                min_object_covered=0.05,
                                 aspect_ratio_range=(0.9, 1.1),
                                 area_range=(0.1, 1.0),
                                 max_attempts=200,
-                                clip_bboxes=True,
                                 scope=None):
     """Generates cropped_image using a one of the bboxes randomly distorted.
 
@@ -225,15 +219,13 @@ def distorted_bounding_box_crop(image,
         cropped_image.set_shape([None, None, 3])
 
         # Update bounding boxes: resize and filter out.
-        bboxes = tfe.bboxes_resize(distort_bbox, bboxes)
-        labels, bboxes = tfe.bboxes_filter_overlap(labels, bboxes,
-                                                   threshold=BBOX_CROP_OVERLAP,
-                                                   assign_negative=False)
+        bboxes = ssd_common.tf_bboxes_resize(distort_bbox, bboxes)
+        labels, bboxes = ssd_common.tf_bboxes_filter_overlap(labels, bboxes,
+                                                             BBOX_CROP_OVERLAP)
         return cropped_image, labels, bboxes, distort_bbox
 
 
-def preprocess_for_train(image, labels, bboxes,
-                         out_shape, data_format='NHWC',
+def preprocess_for_train(image, labels, bboxes, out_shape,
                          scope='ssd_preprocessing_train'):
     """Preprocesses the given image for training.
 
@@ -270,7 +262,6 @@ def preprocess_for_train(image, labels, bboxes,
         dst_image = image
         dst_image, labels, bboxes, distort_bbox = \
             distorted_bounding_box_crop(image, labels, bboxes,
-                                        min_object_covered=MIN_OBJECT_COVERED,
                                         aspect_ratio_range=CROP_RATIO_RANGE)
         # Resize image to output size.
         dst_image = tf_image.resize_image(dst_image, out_shape,
@@ -291,15 +282,10 @@ def preprocess_for_train(image, labels, bboxes,
         # Rescale to VGG input scale.
         image = dst_image * 255.
         image = tf_image_whitened(image, [_R_MEAN, _G_MEAN, _B_MEAN])
-        # Image data format.
-        if data_format == 'NCHW':
-            image = tf.transpose(image, perm=(2, 0, 1))
         return image, labels, bboxes
 
 
-def preprocess_for_eval(image, labels, bboxes,
-                        out_shape=EVAL_SIZE, data_format='NHWC',
-                        difficults=None, resize=Resize.WARP_RESIZE,
+def preprocess_for_eval(image, labels, bboxes, out_shape, resize,
                         scope='ssd_preprocessing_train'):
     """Preprocess an image for evaluation.
 
@@ -323,13 +309,12 @@ def preprocess_for_eval(image, labels, bboxes,
         if bboxes is None:
             bboxes = bbox_img
         else:
-            bboxes = tf.concat([bbox_img, bboxes], axis=0)
+            bboxes = tf.concat(0, [bbox_img, bboxes])
 
+        # Resize strategy...
         if resize == Resize.NONE:
-            # No resizing...
             pass
         elif resize == Resize.CENTRAL_CROP:
-            # Central cropping of the image.
             image, bboxes = tf_image.resize_image_bboxes_with_crop_or_pad(
                 image, bboxes, out_shape[0], out_shape[1])
         elif resize == Resize.PAD_AND_RESIZE:
@@ -347,23 +332,10 @@ def preprocess_for_eval(image, labels, bboxes,
             # Pad to expected size.
             image, bboxes = tf_image.resize_image_bboxes_with_crop_or_pad(
                 image, bboxes, out_shape[0], out_shape[1])
-        elif resize == Resize.WARP_RESIZE:
-            # Warp resize of the image.
-            image = tf_image.resize_image(image, out_shape,
-                                          method=tf.image.ResizeMethod.BILINEAR,
-                                          align_corners=False)
 
         # Split back bounding boxes.
         bbox_img = bboxes[0]
         bboxes = bboxes[1:]
-        # Remove difficult boxes.
-        if difficults is not None:
-            mask = tf.logical_not(tf.cast(difficults, tf.bool))
-            labels = tf.boolean_mask(labels, mask)
-            bboxes = tf.boolean_mask(bboxes, mask)
-        # Image data format.
-        if data_format == 'NCHW':
-            image = tf.transpose(image, perm=(2, 0, 1))
         return image, labels, bboxes, bbox_img
 
 
@@ -371,9 +343,8 @@ def preprocess_image(image,
                      labels,
                      bboxes,
                      out_shape,
-                     data_format,
                      is_training=False,
-                     **kwargs):
+                     resize=Resize.CENTRAL_CROP):
     """Pre-process an given image.
 
     Args:
@@ -394,11 +365,6 @@ def preprocess_image(image,
       A preprocessed image.
     """
     if is_training:
-        return preprocess_for_train(image, labels, bboxes,
-                                    out_shape=out_shape,
-                                    data_format=data_format)
+        return preprocess_for_train(image, labels, bboxes, out_shape)
     else:
-        return preprocess_for_eval(image, labels, bboxes,
-                                   out_shape=out_shape,
-                                   data_format=data_format,
-                                   **kwargs)
+        return preprocess_for_eval(image, labels, bboxes, out_shape, resize)
