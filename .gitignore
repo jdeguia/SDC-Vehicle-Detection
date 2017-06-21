@@ -3,7 +3,9 @@ datasets/__pycache__/
 deployment/__pycache__/
 nets/__pycache__/
 preprocessing/__pycache__/
-
+*.pyc
+*.tfrecord
+kitti
 .ipynb_checkpoints/
 notebooks/.ipynb_checkpoints/
 
