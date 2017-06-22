@@ -1,25 +1,9 @@
-# Copyright 2016 The TensorFlow Authors. All Rights Reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-# http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-# ==============================================================================
-"""Generic training script that trains a SSD model using a given dataset."""
 from pprint import pprint
 
 import tensorflow as tf
 from tensorflow.python.ops import control_flow_ops
 
 from datasets import dataset_factory
-from deployment import model_deploy
 from nets import nets_factory
 from preprocessing import preprocessing_factory
 
@@ -161,6 +145,41 @@ tf.app.flags.DEFINE_boolean(
 FLAGS = tf.app.flags.FLAGS
 
 
+def _average_gradients(tower_grads):
+    """Calculate the average gradient for each shared variable across all towers.
+    Note that this function provides a synchronization point across all towers.
+    Args:
+    tower_grads: List of lists of (gradient, variable) tuples. The outer list
+              is over individual gradients. The inner list is over the gradient
+              calculation for each tower.
+    Returns:
+     List of pairs of (gradient, variable) where the gradient has been averaged
+     across all towers.
+    """
+    average_grads = []
+    for grad_and_vars in zip(*tower_grads):
+        # Note that each grad_and_vars looks like the following:
+        #   ((grad0_gpu0, var0_gpu0), ... , (grad0_gpuN, var0_gpuN))
+        grads = []
+        for g, _ in grad_and_vars:
+          # Add 0 dimension to the gradients to represent the tower.
+          expanded_g = tf.expand_dims(g, 0)
+
+          # Append on a 'tower' dimension which we will average over below.
+          grads.append(expanded_g)
+
+        # Average over the 'tower' dimension.
+        grad = tf.concat(axis=0, values=grads)
+        grad = tf.reduce_mean(grad, 0)
+
+        # Keep in mind that the Variables are redundant because they are shared
+        # across towers. So .. we will just return the first tower's pointer to
+        # the Variable.
+        v = grad_and_vars[0][1]
+        grad_and_var = (grad, v)
+        average_grads.append(grad_and_var)
+    return average_grads
+
 def _configure_learning_rate(num_samples_per_epoch, global_step):
     """Configures the learning rate.
 
@@ -243,79 +262,6 @@ def _configure_optimizer(learning_rate):
     return optimizer
 
 
-def _add_variables_summaries(learning_rate):
-    summaries = []
-    for variable in slim.get_model_variables():
-        summaries.append(tf.summary.histogram(variable.op.name, variable))
-    summaries.append(tf.summary.scalar('training/Learning Rate', learning_rate))
-    return summaries
-
-
-def _get_init_fn():
-    """Returns a function run by the chief worker to warm-start the training.
-    Note that the init_fn is only run when initializing the model during the very
-    first global step.
-
-    Returns:
-      An init function run by the supervisor.
-    """
-    if FLAGS.checkpoint_path is None:
-        return None
-
-    # Warn the user if a checkpoint exists in the train_dir. Then we'll be
-    # ignoring the checkpoint anyway.
-    if tf.train.latest_checkpoint(FLAGS.train_dir):
-        tf.logging.info(
-            'Ignoring --checkpoint_path because a checkpoint already exists in %s'
-            % FLAGS.train_dir)
-        return None
-
-    exclusions = []
-    if FLAGS.checkpoint_exclude_scopes:
-        exclusions = [scope.strip()
-                      for scope in FLAGS.checkpoint_exclude_scopes.split(',')]
-
-    # TODO(sguada) variables.filter_variables()
-    variables_to_restore = []
-    for var in slim.get_model_variables():
-        excluded = False
-        for exclusion in exclusions:
-            if var.op.name.startswith(exclusion):
-                excluded = True
-                break
-        if not excluded:
-            variables_to_restore.append(var)
-
-    if tf.gfile.IsDirectory(FLAGS.checkpoint_path):
-        checkpoint_path = tf.train.latest_checkpoint(FLAGS.checkpoint_path)
-    else:
-        checkpoint_path = FLAGS.checkpoint_path
-    tf.logging.info('Fine-tuning from %s' % checkpoint_path)
-
-    return slim.assign_from_checkpoint_fn(
-        checkpoint_path,
-        variables_to_restore,
-        ignore_missing_vars=FLAGS.ignore_missing_vars)
-
-
-def _get_variables_to_train():
-    """Returns a list of variables to train.
-
-    Returns:
-      A list of variables to train by the optimizer.
-    """
-    if FLAGS.trainable_scopes is None:
-        return tf.trainable_variables()
-    else:
-        scopes = [scope.strip() for scope in FLAGS.trainable_scopes.split(',')]
-
-    variables_to_train = []
-    for scope in scopes:
-        variables = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope)
-        variables_to_train.extend(variables)
-    return variables_to_train
-
-
 def _reshape_list(l, shape=None):
     """Reshape list of (list): 1D to 2D and the other way.
     """
@@ -339,34 +285,17 @@ def _reshape_list(l, shape=None):
     return r
 
 
-# =========================================================================== #
-# Main training routine.
-# =========================================================================== #
 def main(_):
-    if not FLAGS.dataset_dir:
-        raise ValueError('You must supply the dataset directory with --dataset_dir')
-    print('Training FLAGS:')
     pprint(FLAGS.__flags)
 
     tf.logging.set_verbosity(tf.logging.DEBUG)
     with tf.Graph().as_default():
-        # Config model_deploy. Keep TF Slim Models structure.
-        # Useful if want to need multiple GPUs and/or servers in the future.
-        deploy_config = model_deploy.DeploymentConfig(
-            num_clones=FLAGS.num_clones,
-            clone_on_cpu=FLAGS.clone_on_cpu,
-            replica_id=0,
-            num_replicas=1,
-            num_ps_tasks=0)
-        # Create global_step.
-        with tf.device(deploy_config.variables_device()):
+        with tf.device('/cpu:0'):
             global_step = slim.create_global_step()
 
-        # Select the dataset.
         dataset = dataset_factory.get_dataset(
             FLAGS.dataset_name, FLAGS.dataset_split_name, FLAGS.dataset_dir)
 
-        # Get the SSD network and its anchors.
         ssd_class = nets_factory.get_network(FLAGS.model_name)
         ssd_params = ssd_class.default_params._replace(num_classes=FLAGS.num_classes)
         ssd_net = ssd_class(ssd_params)
@@ -379,10 +308,7 @@ def main(_):
         image_preprocessing_fn = preprocessing_factory.get_preprocessing(
             preprocessing_name, is_training=True)
 
-        # =================================================================== #
-        # Create a dataset provider and batches.
-        # =================================================================== #
-        with tf.device(deploy_config.inputs_device()):
+        with tf.device('/cpu:0'):
             with tf.name_scope(FLAGS.dataset_name + '_data_provider'):
                 provider = slim.dataset_data_provider.DatasetDataProvider(
                     dataset,
@@ -415,125 +341,74 @@ def main(_):
             # GPUs running the training.
             batch_queue = slim.prefetch_queue.prefetch_queue(
                 _reshape_list([b_image, b_gclasses, b_glocalisations, b_gscores]),
-                capacity=2 * deploy_config.num_clones)
+                capacity=2 * 1)
 
-        # =================================================================== #
-        # Define the model running on every GPU.
-        # =================================================================== #
-        def clone_fn(batch_queue):
-            """Allows data parallelism by creating multiple
-            clones of network_fn."""
-            # Dequeue batch.
-            b_image, b_gclasses, b_glocalisations, b_gscores = \
-                _reshape_list(batch_queue.dequeue(), batch_shape)
-
-            # Construct SSD network.
-            arg_scope = ssd_net.arg_scope(weight_decay=FLAGS.weight_decay)
-            with slim.arg_scope(arg_scope):
-                predictions, localisations, logits, end_points = \
-                    ssd_net.net(b_image, is_training=True)
-
-            # Add loss functions.
-            ssd_net.losses(logits, localisations,
-                           b_gclasses, b_glocalisations, b_gscores,
-                           label_smoothing=FLAGS.label_smoothing)
-            return end_points
-
-        # Gather initial summaries.
-        summaries = set(tf.get_collection(tf.GraphKeys.SUMMARIES))
-
-        # =================================================================== #
-        # Add summaries from first clone.
-        # =================================================================== #
-        clones = model_deploy.create_clones(deploy_config, clone_fn, [batch_queue])
-        first_clone_scope = deploy_config.clone_scope(0)
-        # Gather update_ops from the first clone. These contain, for example,
-        # the updates for the batch_norm variables created by network_fn.
-        update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS, first_clone_scope)
-
-        # Add summaries for end_points.
-        end_points = clones[0].outputs
-        for end_point in end_points:
-            x = end_points[end_point]
-            summaries.add(tf.summary.histogram('activations/' + end_point, x))
-            summaries.add(tf.summary.scalar('sparsity/' + end_point,
-                                            tf.nn.zero_fraction(x)))
-        # Add summaries for losses.
-        for loss in tf.get_collection(tf.GraphKeys.LOSSES, first_clone_scope):
-            summaries.add(tf.summary.scalar(loss.op.name, loss))
-        # Add summaries for variables.
-        for variable in slim.get_model_variables():
-            summaries.add(tf.summary.histogram(variable.op.name, variable))
-
-        # =================================================================== #
-        # Configure the moving averages.
-        # =================================================================== #
-        if FLAGS.moving_average_decay:
-            moving_average_variables = slim.get_model_variables()
-            variable_averages = tf.train.ExponentialMovingAverage(
-                FLAGS.moving_average_decay, global_step)
-        else:
-            moving_average_variables, variable_averages = None, None
-
-        # =================================================================== #
-        # Configure the optimization procedure.
-        # =================================================================== #
-        with tf.device(deploy_config.optimizer_device()):
+        with tf.device('/cpu:0'):
             learning_rate = _configure_learning_rate(dataset.num_samples, global_step)
             optimizer = _configure_optimizer(learning_rate)
-            summaries.add(tf.summary.scalar('learning_rate', learning_rate))
 
-        if FLAGS.moving_average_decay:
-            # Update ops executed locally by trainer.
-            update_ops.append(variable_averages.apply(moving_average_variables))
+        tower_grads=[]
+        tower_losses=[]
+        with tf.variable_scope(tf.get_variable_scope()):
+            for gid in range(1):
+                b_image, b_gclasses, b_glocalisations, b_gscores = \
+                    _reshape_list(batch_queue.dequeue(), batch_shape)
 
-        # Variables to train.
-        variables_to_train = _get_variables_to_train()
+                device_scopes = []
+                with tf.device('/gpu:%d' % gid):
+                    with tf.name_scope('%s_%d' % ("tower", gid)) as scope:
+                        b_image, b_gclasses, b_glocalisations, b_gscores = \
+                            _reshape_list(batch_queue.dequeue(), batch_shape)
 
-        # and returns a train_tensor and summary_op
-        total_loss, clones_gradients = model_deploy.optimize_clones(
-            clones,
-            optimizer,
-            var_list=variables_to_train)
-        # Add total_loss to summary.
-        summaries.add(tf.summary.scalar('total_loss', total_loss))
+                        arg_scope = ssd_net.arg_scope(weight_decay=0.0004)
+                        with slim.arg_scope(arg_scope):
+                            predictions, localisations, logits, end_points = \
+                                ssd_net.net(b_image, is_training=True)
 
-        # Create gradient updates.
-        grad_updates = optimizer.apply_gradients(clones_gradients,
-                                                 global_step=global_step)
-        update_ops.append(grad_updates)
-        update_op = tf.group(*update_ops)
-        train_tensor = control_flow_ops.with_dependencies([update_op], total_loss,
-                                                          name='train_op')
+        #                 # Add loss functions.
+        #                 ssd_net.losses(logits, localisations,
+        #                                b_gclasses, b_glocalisations, b_gscores,
+        #                                label_smoothing=0.0)
 
-        # Add the summaries from the first clone. These contain the summaries
-        summaries |= set(tf.get_collection(tf.GraphKeys.SUMMARIES,
-                                           first_clone_scope))
-        # Merge all summaries together.
-        summary_op = tf.summary.merge(list(summaries), name='summary_op')
+        #                 all_losses = tf.get_collection(tf.GraphKeys.LOSSES, scope)
+        #                 sum_loss = tf.add_n(all_losses)
+
+        #                 # Reuse variables for the next tower.
+        #                 tf.get_variable_scope().reuse_variables()
+
+        #                 # Calculate the gradients for the batch of data
+        #                 grads = optimizer.compute_gradients(sum_loss)
+
+        #                 # Keep track of the gradients across all towers.
+        #                 tower_grads.append(grads)
+        #                 tower_losses.append(sum_loss)
+        #                 device_scopes.append(scope)
+
+        # total_loss = tf.add_n(tower_losses, name='total_loss')
+        # grads = _average_gradients(tower_grads)
+        # update_ops = optimizer.apply_gradients(grads, global_step=global_step)
+        # update_op = update_ops
+        # train_tensor = control_flow_ops.with_dependencies([update_op], total_loss,
+        #                                                   name='train_op')
 
         # =================================================================== #
         # Kicks off the training.
         # =================================================================== #
-        config = tf.ConfigProto(log_device_placement=False)
-        saver = tf.train.Saver(max_to_keep=5,
-                               keep_checkpoint_every_n_hours=1.0,
-                               write_version=2,
-                               pad_step_number=False)
-        slim.learning.train(
-            train_tensor,
-            logdir=FLAGS.train_dir,
-            master='',
-            is_chief=True,
-            init_fn=None, #_get_init_fn(),
-            summary_op=summary_op,
-            number_of_steps=FLAGS.max_number_of_steps,
-            log_every_n_steps=FLAGS.log_every_n_steps,
-            save_summaries_secs=FLAGS.save_summaries_secs,
-            saver=saver,
-            save_interval_secs=FLAGS.save_interval_secs,
-            sync_optimizer=None,
-            session_config=config)
+        config = tf.ConfigProto(log_device_placement=False,
+                                allow_soft_placement=True)
+
+        import time
+        with tf.Session(config=config) as sess:
+            sess.run(tf.global_variables_initializer())
+            tf.train.start_queue_runners(sess=sess)
+
+            for i in range(10000):
+                start = time.time()
+                gl,_ = sess.run([global_step, logits])
+                end = time.time()
+                print(end - start)
+                # if gl % 10 == 0: print(gl)
+            quit()
 
 
 if __name__ == '__main__':
