@@ -13,7 +13,7 @@ slim = tf.contrib.slim
 tf.app.flags.DEFINE_string(
     'train_dir', '/tmp/tfmodel/',
     'Directory where checkpoints and event logs are written to.')
-tf.app.flags.DEFINE_integer('num_clones', 1,
+tf.app.flags.DEFINE_integer('num_clones', 4,
                             'Number of model clones to deploy.')
 tf.app.flags.DEFINE_boolean('clone_on_cpu', False,
                             'Use CPUs to deploy clones.')
@@ -290,11 +290,15 @@ def main(_):
 
     tf.logging.set_verbosity(tf.logging.DEBUG)
     with tf.Graph().as_default():
-        with tf.device('/cpu:0'):
-            global_step = slim.create_global_step()
 
         dataset = dataset_factory.get_dataset(
             FLAGS.dataset_name, FLAGS.dataset_split_name, FLAGS.dataset_dir)
+        
+        with tf.device('/cpu:0'):
+            global_step = slim.create_global_step()
+            learning_rate = _configure_learning_rate(dataset.num_samples, global_step)
+            optimizer = _configure_optimizer(learning_rate)
+
 
         ssd_class = nets_factory.get_network(FLAGS.model_name)
         ssd_params = ssd_class.default_params._replace(num_classes=FLAGS.num_classes)
@@ -341,20 +345,16 @@ def main(_):
             # GPUs running the training.
             batch_queue = slim.prefetch_queue.prefetch_queue(
                 _reshape_list([b_image, b_gclasses, b_glocalisations, b_gscores]),
-                capacity=2 * 1)
-
-        with tf.device('/cpu:0'):
-            learning_rate = _configure_learning_rate(dataset.num_samples, global_step)
-            optimizer = _configure_optimizer(learning_rate)
+                capacity=2 * FLAGS.num_clones)
 
         tower_grads=[]
         tower_losses=[]
+        device_scopes = []
         with tf.variable_scope(tf.get_variable_scope()):
-            for gid in range(1):
+            for gid in range(FLAGS.num_clones):
                 b_image, b_gclasses, b_glocalisations, b_gscores = \
                     _reshape_list(batch_queue.dequeue(), batch_shape)
 
-                device_scopes = []
                 with tf.device('/gpu:%d' % gid):
                     with tf.name_scope('%s_%d' % ("tower", gid)) as scope:
                         b_image, b_gclasses, b_glocalisations, b_gscores = \
@@ -365,31 +365,36 @@ def main(_):
                             predictions, localisations, logits, end_points = \
                                 ssd_net.net(b_image, is_training=True)
 
-        #                 # Add loss functions.
-        #                 ssd_net.losses(logits, localisations,
-        #                                b_gclasses, b_glocalisations, b_gscores,
-        #                                label_smoothing=0.0)
+                        # Add loss functions.
+                        ssd_net.losses(logits, localisations,
+                                       b_gclasses, b_glocalisations, b_gscores,
+                                       label_smoothing=0.0)
 
-        #                 all_losses = tf.get_collection(tf.GraphKeys.LOSSES, scope)
-        #                 sum_loss = tf.add_n(all_losses)
+                        all_losses = tf.get_collection(tf.GraphKeys.LOSSES, scope)
+                        sum_loss = tf.add_n(all_losses)
 
-        #                 # Reuse variables for the next tower.
-        #                 tf.get_variable_scope().reuse_variables()
+                        # Reuse variables for the next tower.
+                        tf.get_variable_scope().reuse_variables()
 
-        #                 # Calculate the gradients for the batch of data
-        #                 grads = optimizer.compute_gradients(sum_loss)
+                        # Calculate the gradients for the batch of data
+                        grads = optimizer.compute_gradients(sum_loss)
 
-        #                 # Keep track of the gradients across all towers.
-        #                 tower_grads.append(grads)
-        #                 tower_losses.append(sum_loss)
-        #                 device_scopes.append(scope)
+                        # Keep track of the gradients across all towers.
+                        tower_grads.append(grads)
+                        tower_losses.append(sum_loss)
+                        device_scopes.append(scope)
 
-        # total_loss = tf.add_n(tower_losses, name='total_loss')
-        # grads = _average_gradients(tower_grads)
-        # update_ops = optimizer.apply_gradients(grads, global_step=global_step)
-        # update_op = update_ops
-        # train_tensor = control_flow_ops.with_dependencies([update_op], total_loss,
-        #                                                   name='train_op')
+        total_loss = tf.add_n(tower_losses, name='total_loss')
+        grads = _average_gradients(tower_grads)
+        apply_gradient_ops = optimizer.apply_gradients(grads, global_step=global_step)
+
+        ema = tf.train.ExponentialMovingAverage(0.999, global_step)
+        averages_op = ema.apply(tf.trainable_variables())
+
+        # Group all updates to into a single train op.
+        train_op = tf.group(apply_gradient_ops, averages_op)
+        train_tensor = control_flow_ops.with_dependencies([train_op], total_loss,
+                                                          name='train_op')
 
         # =================================================================== #
         # Kicks off the training.
@@ -397,18 +402,41 @@ def main(_):
         config = tf.ConfigProto(log_device_placement=False,
                                 allow_soft_placement=True)
 
-        import time
-        with tf.Session(config=config) as sess:
-            sess.run(tf.global_variables_initializer())
-            tf.train.start_queue_runners(sess=sess)
+        saver = tf.train.Saver(tf.global_variables(), max_to_keep=20)
 
-            for i in range(10000):
-                start = time.time()
-                gl,_ = sess.run([global_step, logits])
-                end = time.time()
-                print(end - start)
-                # if gl % 10 == 0: print(gl)
-            quit()
+        slim.learning.train(
+            train_tensor,
+            logdir='logs',
+            master='',
+            is_chief=True,
+            init_fn=None,
+            summary_op=None,
+            number_of_steps=1,
+            log_every_n_steps=10,
+            save_summaries_secs=60,
+            saver=saver,
+            save_interval_secs=60,
+            sync_optimizer=None,
+            session_config=config)
+
+        import pdb; pdb.set_trace()
+
+        # summary_op = tf.summary.merge_all()
+
+        # import time
+        # with tf.Session(config=config) as sess:
+        #     sess.run(tf.global_variables_initializer())
+        #     tf.train.start_queue_runners(sess=sess)
+
+        #     train_writer = tf.summary.FileWriter('./logs', sess.graph)
+        #     for i in range(10000):
+        #         start = time.time()
+        #         gl,_, summary_str = sess.run([global_step, train_tensor, summary_op])
+        #         end = time.time()
+        #         print(end - start)
+        #         train_writer.add_summary(summary_str, gl)
+        #         # if gl % 10 == 0: print(gl)
+        #     quit()
 
 
 if __name__ == '__main__':

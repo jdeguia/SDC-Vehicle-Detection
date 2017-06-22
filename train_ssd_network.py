@@ -515,7 +515,8 @@ def main(_):
         # =================================================================== #
         # Kicks off the training.
         # =================================================================== #
-        config = tf.ConfigProto(log_device_placement=False)
+        config = tf.ConfigProto(allow_soft_placement=True,
+                                    log_device_placement=False)
         saver = tf.train.Saver(max_to_keep=5,
                                keep_checkpoint_every_n_hours=1.0,
                                write_version=2,
@@ -526,7 +527,7 @@ def main(_):
             master='',
             is_chief=True,
             init_fn=None, #_get_init_fn(),
-            summary_op=summary_op,
+            summary_op=None,#summary_op,
             number_of_steps=FLAGS.max_number_of_steps,
             log_every_n_steps=FLAGS.log_every_n_steps,
             save_summaries_secs=FLAGS.save_summaries_secs,
