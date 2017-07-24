@@ -19,7 +19,7 @@ from datasets import pascalvoc_common
 
 slim = tf.contrib.slim
 
-FILE_PATTERN = 'voc_2012_%s.tfrecord'
+FILE_PATTERN = 'pascalvoc_2012_%s.tfrecord'
 ITEMS_TO_DESCRIPTIONS = {
     'image': 'A color image of varying height and width.',
     'shape': 'Shape of the image',
@@ -28,6 +28,7 @@ ITEMS_TO_DESCRIPTIONS = {
 }
 SPLITS_TO_SIZES = {
     'train': 17125,
+    'overfit-6': 6
 }
 NUM_CLASSES = 20
 
